@@ -25,14 +25,22 @@ except ImportError:  # pragma: no cover - environment dependent
     Image = None
     TAGS = {}
 
-DEFAULT_EXTENSIONS = ".jpg,.jpeg,.heic,.png"
+DEFAULT_EXTENSIONS = ".jpg,.jpeg,.heic,.png,.arw"
 EXIF_FALLBACK_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")
 
 
 @dataclass(frozen=True)
 class PhotoFile:
     path: Path
+    capture_dt: dt.datetime | None
+
+
+@dataclass(frozen=True)
+class PhotoGroup:
+    key_dir: Path
+    key_stem: str
     capture_dt: dt.datetime
+    files: tuple[PhotoFile, ...]
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,29 +128,55 @@ def parse_exif_datetime(raw: str) -> dt.datetime | None:
     return None
 
 
-def collect_photos(root: Path, recursive: bool, extensions: set[str]) -> tuple[list[PhotoFile], list[Path]]:
-    photos: list[PhotoFile] = []
-    skipped: list[Path] = []
+def collect_files(root: Path, recursive: bool, extensions: set[str]) -> list[PhotoFile]:
+    candidates: list[PhotoFile] = []
     for path in iter_candidate_files(root, recursive, extensions):
-        capture = read_capture_datetime(path)
-        if capture is None:
-            skipped.append(path)
+        candidates.append(PhotoFile(path=path, capture_dt=read_capture_datetime(path)))
+    return candidates
+
+
+def build_groups(files: list[PhotoFile]) -> tuple[list[PhotoGroup], list[Path]]:
+    grouped: dict[tuple[Path, str], list[PhotoFile]] = {}
+    for file in files:
+        key = (file.path.parent, file.path.stem)
+        grouped.setdefault(key, []).append(file)
+
+    usable_groups: list[PhotoGroup] = []
+    skipped: list[Path] = []
+
+    for (key_dir, key_stem), members in grouped.items():
+        capture_candidates = [member.capture_dt for member in members if member.capture_dt is not None]
+        if not capture_candidates:
+            skipped.extend(member.path for member in members)
             continue
-        photos.append(PhotoFile(path=path, capture_dt=capture))
-    return photos, skipped
+
+        group_capture_dt = min(capture_candidates)
+        sorted_members = tuple(sorted(members, key=lambda item: item.path.name))
+        usable_groups.append(
+            PhotoGroup(
+                key_dir=key_dir,
+                key_stem=key_stem,
+                capture_dt=group_capture_dt,
+                files=sorted_members,
+            )
+        )
+
+    return usable_groups, sorted(skipped)
 
 
-def build_rename_plan(photos: list[PhotoFile]) -> list[tuple[Path, Path]]:
-    ordered = sorted(photos, key=lambda p: (p.capture_dt, p.path.name))
+def build_rename_plan(groups: list[PhotoGroup]) -> list[tuple[Path, Path]]:
+    ordered_groups = sorted(groups, key=lambda g: (g.capture_dt, g.key_stem, g.key_dir.as_posix()))
 
     serial_by_day: dict[str, int] = {}
     plan: list[tuple[Path, Path]] = []
-    for photo in ordered:
-        day = photo.capture_dt.strftime("%Y-%m-%d")
+    for group in ordered_groups:
+        day = group.capture_dt.strftime("%Y-%m-%d")
         serial_by_day[day] = serial_by_day.get(day, 0) + 1
         new_stem = f"{day}-{serial_by_day[day]:05d}"
-        target = photo.path.with_name(f"{new_stem}{photo.path.suffix.lower()}")
-        plan.append((photo.path, target))
+
+        for file in group.files:
+            target = file.path.with_name(f"{new_stem}{file.path.suffix.lower()}")
+            plan.append((file.path, target))
 
     return plan
 
@@ -209,15 +243,17 @@ def main() -> int:
         print("ERROR: --ext produced no valid extension", file=sys.stderr)
         return 2
 
-    photos, skipped = collect_photos(root, args.recursive, extensions)
-    print(f"Scanned files with matching extensions: {len(photos) + len(skipped)}")
-    print(f"Files with usable EXIF datetime: {len(photos)}")
+    files = collect_files(root, args.recursive, extensions)
+    groups, skipped = build_groups(files)
+
+    print(f"Scanned files with matching extensions: {len(files)}")
+    print(f"Usable filename groups: {len(groups)}")
     if skipped:
-        print("Skipped files without usable EXIF datetime:")
+        print("Skipped files without usable EXIF datetime in their basename group:")
         for path in skipped:
             print(f"  - {path}")
 
-    plan = build_rename_plan(photos)
+    plan = build_rename_plan(groups)
     errors = validate_plan(plan)
     if errors:
         print("ERROR: rename plan validation failed:", file=sys.stderr)
